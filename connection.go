@@ -16,6 +16,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/quic-go/quic-go/congestion"
 	"github.com/quic-go/quic-go/internal/ackhandler"
 	"github.com/quic-go/quic-go/internal/handshake"
 	"github.com/quic-go/quic-go/internal/monotime"
@@ -3262,4 +3263,11 @@ func (c *Conn) NextConnection(ctx context.Context) (*Conn, error) {
 // connection ID length), and the size of the encryption tag.
 func estimateMaxPayloadSize(mtu protocol.ByteCount) protocol.ByteCount {
 	return mtu - 1 /* type byte */ - 20 /* maximum connection ID length */ - 16 /* tag size */
+}
+
+// SetCongestionControl replaces the connection's congestion controller with
+// one returned by newCC, given the current maximum datagram size. If the
+// connection migrates to a new path, newCC is called again for that path.
+func (c *Conn) SetCongestionControl(newCC func(maxDatagramSize congestion.ByteCount) congestion.CongestionControl) {
+	c.sentPacketHandler.SetCongestionControl(newCC)
 }
