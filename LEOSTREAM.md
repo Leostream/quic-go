@@ -8,11 +8,13 @@ Nothing else differs, so it can be rebased onto each upstream release.
 - `Conn.SetCongestionControl(newCC)`: installs a controller from a constructor. Unlike
   apernet's version, the constructor is called again after a path migration, so the
   custom controller isn't silently replaced by quic-go's default (Reno).
+- A custom controller keeps `ConnectionStats` (lost packets and bytes, congestion window)
+  as quic-go's own sender does, and lost MTU probes don't reach it as congestion.
 
 Consumers keep importing `github.com/quic-go/quic-go` and add:
 
 ```
-replace github.com/quic-go/quic-go => github.com/Leostream/quic-go v0.65.1-leostream.1
+replace github.com/quic-go/quic-go => github.com/Leostream/quic-go v0.65.1-leostream.2
 ```
 
 ## Updating to a new upstream release

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	congestionExt "github.com/quic-go/quic-go/congestion"
@@ -116,8 +117,10 @@ type sentPacketHandler struct {
 
 	bytesInFlight protocol.ByteCount
 
-	congestion      congestion.SendAlgorithmWithDebugInfos
-	congestionMutex sync.RWMutex // guards congestion, newCC and maxDatagramSize
+	// congestion is read on every packet; it is swapped only under congestionMutex,
+	// which also guards newCC and maxDatagramSize.
+	congestion      atomic.Pointer[congestion.SendAlgorithmWithDebugInfos]
+	congestionMutex sync.Mutex
 	// newCC, when set, replaces the default controller, also after a migration.
 	newCC           func(congestionExt.ByteCount) congestionExt.CongestionControl
 	maxDatagramSize protocol.ByteCount
@@ -186,7 +189,6 @@ func NewSentPacketHandler(
 		lostPackets:        *newLostPacketTracker(),
 		rttStats:           rttStats,
 		connStats:          connStats,
-		congestion:         congestion,
 		maxDatagramSize:    initialMaxDatagramSize,
 		ignorePacketsBelow: ignorePacketsBelow,
 		perspective:        pers,
@@ -197,6 +199,7 @@ func NewSentPacketHandler(
 		h.enableECN = true
 		h.ecnTracker = newECNTracker(logger, qlogger)
 	}
+	h.setCongestionControl(congestion)
 	h.qlogRecoveryParametersSet(true)
 	return h
 }
@@ -460,6 +463,7 @@ func (h *sentPacketHandler) ReceivedAck(ack *wire.AckFrame, encLevel protocol.En
 		return false, err
 	}
 	cc := h.getCongestionControl()
+	_, collect := cc.(congestion.SendAlgorithmEx)
 
 	// update the RTT, if:
 	// * the largest acked is newly acknowledged, AND
@@ -481,11 +485,6 @@ func (h *sentPacketHandler) ReceivedAck(ack *wire.AckFrame, encLevel protocol.En
 			cc.MaybeExitSlowStart()
 		}
 	}
-
-	// The extended congestion event only reports what this ACK acknowledged and
-	// what it declared lost.
-	h.ackedPacketsInfo = h.ackedPacketsInfo[:0]
-	h.lostPacketsInfo = h.lostPacketsInfo[:0]
 
 	// Detect spurious losses even if no outstanding packets were newly acknowledged.
 	var spuriousLosses []protocol.PacketNumber
@@ -522,9 +521,7 @@ func (h *sentPacketHandler) ReceivedAck(ack *wire.AckFrame, encLevel protocol.En
 		cc.OnSpuriousLoss(pn)
 	}
 	if len(ackedPackets) == 0 {
-		if cex, ok := cc.(congestion.SendAlgorithmEx); ok && len(h.lostPacketsInfo) != 0 {
-			cex.OnCongestionEventEx(priorInFlight, rcvTime, nil, h.lostPacketsInfo)
-		}
+		h.congestionEventEx(cc, priorInFlight, rcvTime)
 		if len(spuriousLosses) > 0 && h.qlogger != nil {
 			h.qlogMetricsUpdated()
 		}
@@ -538,10 +535,12 @@ func (h *sentPacketHandler) ReceivedAck(ack *wire.AckFrame, encLevel protocol.En
 	for _, p := range ackedPackets {
 		if p.includedInBytesInFlight {
 			cc.OnPacketAcked(p.PacketNumber, p.Length, priorInFlight, rcvTime)
-			h.ackedPacketsInfo = append(h.ackedPacketsInfo, congestionExt.AckedPacketInfo{
-				PacketNumber: congestionExt.PacketNumber(p.PacketNumber),
-				BytesAcked:   congestionExt.ByteCount(p.Length),
-			})
+			if collect {
+				h.ackedPacketsInfo = append(h.ackedPacketsInfo, congestionExt.AckedPacketInfo{
+					PacketNumber: congestionExt.PacketNumber(p.PacketNumber),
+					BytesAcked:   congestionExt.ByteCount(p.Length),
+				})
+			}
 		}
 		if p.EncryptionLevel == protocol.Encryption1RTT {
 			acked1RTTPacket = true
@@ -552,18 +551,13 @@ func (h *sentPacketHandler) ReceivedAck(ack *wire.AckFrame, encLevel protocol.En
 		}
 	}
 
-	if cex, ok := cc.(congestion.SendAlgorithmEx); ok &&
-		(len(h.ackedPacketsInfo) != 0 || len(h.lostPacketsInfo) != 0) {
-		cex.OnCongestionEventEx(priorInFlight, rcvTime, h.ackedPacketsInfo, h.lostPacketsInfo)
-	}
+	h.congestionEventEx(cc, priorInFlight, rcvTime)
 
 	// After this point, we must not use ackedPackets any longer!
 	// We've already returned the buffers.
 	ackedPackets = nil    //nolint:ineffassign // This is just to be on the safe side.
 	clear(h.ackedPackets) // make sure the memory is released
 	h.ackedPackets = h.ackedPackets[:0]
-	h.ackedPacketsInfo = h.ackedPacketsInfo[:0]
-	h.lostPacketsInfo = h.lostPacketsInfo[:0]
 
 	// Reset the pto_count unless the client is unsure if the server has validated the client's address.
 	if h.peerCompletedAddressValidation {
@@ -914,7 +908,6 @@ func countPacketNumbers(pns []protocol.PacketNumber, lower, upper protocol.Packe
 }
 
 func (h *sentPacketHandler) detectLostPackets(now monotime.Time, encLevel protocol.EncryptionLevel) {
-	h.lostPacketsInfo = h.lostPacketsInfo[:0]
 	pnSpace := h.getPacketNumberSpace(encLevel.PacketNumberSpace())
 	pnSpace.lossTime = 0
 	space := encLevel.PacketNumberSpace()
@@ -933,6 +926,7 @@ func (h *sentPacketHandler) detectLostPackets(now monotime.Time, encLevel protoc
 	lostSendTime := now.Add(-lossDelay)
 
 	cc := h.getCongestionControl()
+	_, collect := cc.(congestion.SendAlgorithmEx)
 	priorInFlight := h.bytesInFlight
 	for pn, p := range h.hist.Packets() {
 		if pn > pnSpace.largestAcked {
@@ -1009,11 +1003,13 @@ func (h *sentPacketHandler) detectLostPackets(now monotime.Time, encLevel protoc
 				h.queueFramesForRetransmission(p)
 				if !p.IsPathMTUProbePacket {
 					cc.OnCongestionEvent(pn, p.Length, priorInFlight)
+					if collect {
+						h.lostPacketsInfo = append(h.lostPacketsInfo, congestionExt.LostPacketInfo{
+							PacketNumber: congestionExt.PacketNumber(pn),
+							BytesLost:    congestionExt.ByteCount(p.Length),
+						})
+					}
 				}
-				h.lostPacketsInfo = append(h.lostPacketsInfo, congestionExt.LostPacketInfo{
-					PacketNumber: congestionExt.PacketNumber(pn),
-					BytesLost:    congestionExt.ByteCount(p.Length),
-				})
 				if encLevel == protocol.Encryption1RTT && h.ecnTracker != nil {
 					h.ecnTracker.LostPacket(pn)
 				}
@@ -1051,9 +1047,7 @@ func (h *sentPacketHandler) OnLossDetectionTimeout(now monotime.Time) error {
 		}
 		// Early retransmit or time loss detection
 		h.detectLostPackets(now, encLevel)
-		if cex, ok := h.getCongestionControl().(congestion.SendAlgorithmEx); ok && len(h.lostPacketsInfo) != 0 {
-			cex.OnCongestionEventEx(priorInFlight, now, nil, h.lostPacketsInfo)
-		}
+		h.congestionEventEx(h.getCongestionControl(), priorInFlight, now)
 		return nil
 	}
 
@@ -1194,7 +1188,7 @@ func (h *sentPacketHandler) SetMaxDatagramSize(s protocol.ByteCount) {
 	h.congestionMutex.Lock()
 	defer h.congestionMutex.Unlock()
 	h.maxDatagramSize = s
-	h.congestion.SetMaxDatagramSize(s)
+	h.getCongestionControl().SetMaxDatagramSize(s)
 }
 
 func (h *sentPacketHandler) isAmplificationLimited() bool {
@@ -1304,16 +1298,16 @@ func (h *sentPacketHandler) MigratedPath(now monotime.Time, initialMaxDatagramSi
 	h.congestionMutex.Lock()
 	h.maxDatagramSize = initialMaxDatagramSize
 	if h.newCC != nil {
-		h.congestion = h.customCongestionControl()
+		h.setCongestionControl(h.customCongestionControl())
 	} else {
-		h.congestion = congestion.NewCubicSender(
+		h.setCongestionControl(congestion.NewCubicSender(
 			congestion.DefaultClock{},
 			h.rttStats,
 			h.connStats,
 			initialMaxDatagramSize,
 			true, // use Reno
 			h.qlogger,
-		)
+		))
 	}
 	h.congestionMutex.Unlock()
 	h.qlogRecoveryParametersSet(true)
@@ -1321,9 +1315,11 @@ func (h *sentPacketHandler) MigratedPath(now monotime.Time, initialMaxDatagramSi
 }
 
 func (h *sentPacketHandler) getCongestionControl() congestion.SendAlgorithmWithDebugInfos {
-	h.congestionMutex.RLock()
-	defer h.congestionMutex.RUnlock()
-	return h.congestion
+	return *h.congestion.Load()
+}
+
+func (h *sentPacketHandler) setCongestionControl(cc congestion.SendAlgorithmWithDebugInfos) {
+	h.congestion.Store(&cc)
 }
 
 // SetCongestionControl replaces the congestion controller with one from newCC.
@@ -1332,14 +1328,21 @@ func (h *sentPacketHandler) SetCongestionControl(newCC func(maxDatagramSize cong
 	h.congestionMutex.Lock()
 	defer h.congestionMutex.Unlock()
 	h.newCC = newCC
-	h.congestion = h.customCongestionControl()
+	h.setCongestionControl(h.customCongestionControl())
 }
 
 func (h *sentPacketHandler) customCongestionControl() congestion.SendAlgorithmWithDebugInfos {
 	cc := h.newCC(congestionExt.ByteCount(h.maxDatagramSize))
 	cc.SetRTTStatsProvider(h.rttStats)
-	if ccEx, ok := cc.(congestionExt.CongestionControlEx); ok {
-		return &ccAdapterEx{ccEx}
+	return newCCAdapter(cc, h.connStats)
+}
+
+// congestionEventEx reports what one ACK or loss timeout acknowledged and
+// declared lost to a controller that takes them together, then clears them.
+func (h *sentPacketHandler) congestionEventEx(cc congestion.SendAlgorithmWithDebugInfos, priorInFlight protocol.ByteCount, now monotime.Time) {
+	if cex, ok := cc.(congestion.SendAlgorithmEx); ok && (len(h.ackedPacketsInfo) > 0 || len(h.lostPacketsInfo) > 0) {
+		cex.OnCongestionEventEx(priorInFlight, now, h.ackedPacketsInfo, h.lostPacketsInfo)
 	}
-	return &ccAdapter{cc}
+	h.ackedPacketsInfo = h.ackedPacketsInfo[:0]
+	h.lostPacketsInfo = h.lostPacketsInfo[:0]
 }

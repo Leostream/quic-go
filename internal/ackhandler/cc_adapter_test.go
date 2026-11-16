@@ -61,14 +61,16 @@ func (c *recordingCongestionControlEx) OnCongestionEventEx(_ congestion.ByteCoun
 }
 
 // Each extended congestion event must report exactly what the triggering ACK
-// or loss timer found, and nothing left over from an earlier event.
+// or loss timer found, and nothing left over from an earlier event. Lost MTU
+// probes are not congestion, and losses are counted in the connection stats.
 func TestSentPacketHandlerCongestionEventEx(t *testing.T) {
 	rttStats := utils.NewRTTStats()
+	stats := &utils.ConnectionStats{}
 	sph := NewSentPacketHandler(
 		0,
 		1200,
 		rttStats,
-		&utils.ConnectionStats{},
+		stats,
 		true,
 		false,
 		nil,
@@ -80,12 +82,13 @@ func TestSentPacketHandlerCongestionEventEx(t *testing.T) {
 	sph.SetCongestionControl(func(congestion.ByteCount) congestion.CongestionControl { return cc })
 
 	var packets packetTracker
-	sendPacket := func(ti monotime.Time) protocol.PacketNumber {
+	send := func(ti monotime.Time, mtuProbe bool) protocol.PacketNumber {
 		t.Helper()
 		pn := sph.PopPacketNumber(protocol.PacketNumberSpaceAppData)
-		sph.SentPacket(ti, pn, protocol.InvalidPacketNumber, nil, []Frame{packets.NewPingFrame(pn)}, protocol.Encryption1RTT, protocol.ECNNon, 1000, false, false)
+		sph.SentPacket(ti, pn, protocol.InvalidPacketNumber, nil, []Frame{packets.NewPingFrame(pn)}, protocol.Encryption1RTT, protocol.ECNNon, 1000, mtuProbe, false)
 		return pn
 	}
+	sendPacket := func(ti monotime.Time) protocol.PacketNumber { return send(ti, false) }
 	ack := func(rcvTime monotime.Time, pns ...protocol.PacketNumber) {
 		t.Helper()
 		_, err := sph.ReceivedAck(&wire.AckFrame{AckRanges: ackRanges(pns...)}, protocol.Encryption1RTT, rcvTime)
@@ -94,6 +97,7 @@ func TestSentPacketHandlerCongestionEventEx(t *testing.T) {
 
 	const rtt = time.Second
 	now := monotime.Now()
+	send(now.Add(-rtt), true)
 	pn1 := sendPacket(now.Add(-rtt))
 	pn2 := sendPacket(now.Add(-10 * time.Millisecond))
 	pn3 := sendPacket(now)
@@ -103,10 +107,13 @@ func TestSentPacketHandlerCongestionEventEx(t *testing.T) {
 	require.Equal(t, []congestionEventEx{
 		{acked: []congestion.PacketNumber{congestion.PacketNumber(pn3)}, lost: []congestion.PacketNumber{congestion.PacketNumber(pn1)}},
 	}, cc.events)
+	require.Equal(t, uint64(1), stats.PacketsLost.Load())
 
 	// the loss timer declares pn2 lost
 	sph.OnLossDetectionTimeout(sph.GetLossDetectionTimeout())
 	require.Equal(t, congestionEventEx{lost: []congestion.PacketNumber{congestion.PacketNumber(pn2)}}, cc.events[1])
+	require.Equal(t, uint64(2), stats.PacketsLost.Load())
+	require.Equal(t, uint64(1<<20), stats.CongestionWindow.Load())
 
 	// a duplicate ACK acknowledges nothing new and must not report pn2 again
 	ack(now.Add(2*rtt), pn3)

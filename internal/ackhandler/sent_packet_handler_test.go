@@ -1329,7 +1329,7 @@ func TestSentPacketHandlerCongestion(t *testing.T) {
 		nil,
 		utils.DefaultLogger,
 	)
-	sph.(*sentPacketHandler).congestion = cong
+	sph.(*sentPacketHandler).setCongestionControl(cong)
 
 	var packets packetTracker
 	// Send the first 5 packets: not congestion-limited, not pacing-limited.
@@ -1529,7 +1529,7 @@ func TestSentPacketHandlerECN(t *testing.T) {
 		utils.DefaultLogger,
 	)
 	sph.(*sentPacketHandler).ecnTracker = ecnHandler
-	sph.(*sentPacketHandler).congestion = cong
+	sph.(*sentPacketHandler).setCongestionControl(cong)
 
 	// ECN marks on non-1-RTT packets are ignored
 	sph.SentPacket(monotime.Now(), sph.PopPacketNumber(protocol.PacketNumberSpaceInitial), protocol.InvalidPacketNumber, nil, nil, protocol.EncryptionInitial, protocol.ECT1, 1200, false, false)
