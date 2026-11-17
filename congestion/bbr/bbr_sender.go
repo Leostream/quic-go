@@ -669,6 +669,13 @@ func (b *bbrSender) bandwidthEstimate() Bandwidth {
 	return b.maxBandwidth.GetBest()
 }
 
+// BandwidthEstimate is the bottleneck bandwidth estimate (BBR's BtlBw), without
+// the pacing gain. Like the rest of the sender, read it only where the
+// connection runs congestion control (from a SendStream write limiter).
+func (b *bbrSender) BandwidthEstimate() Bandwidth {
+	return b.bandwidthEstimate()
+}
+
 func (b *bbrSender) bandwidthForPacer() congestion.ByteCount {
 	bps := congestion.ByteCount(float64(b.PacingRate()) / float64(BytesPerSecond))
 	if bps < minBps {
